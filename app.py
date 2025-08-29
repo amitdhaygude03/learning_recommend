@@ -1,212 +1,149 @@
-# app.py — Personalized Learning Recommendation App (EdTech) with Admin, Auth, Guided Path
-# -----------------------------------------------------------------------------
-# Features:
-#  - User login (simple auth)
-#  - Admin page: upload CSVs (courses, books, projects)
-#  - Personalized recommendations (content-based)
-#  - Guided learning path (sequence by difficulty/est. hours)
-#  - Progress tracking dashboard
-# -----------------------------------------------------------------------------
-
-from __future__ import annotations
-import json
-from pathlib import Path
-from typing import Dict, List, Tuple
-
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
+import pickle
+import os
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-APP_TITLE = "🎓 Personalized Learning Recommender"
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
-
-COURSES_FILE = DATA_DIR / "courses.csv"
-BOOKS_FILE = DATA_DIR / "books.csv"
-PROJECTS_FILE = DATA_DIR / "projects.csv"
-PROGRESS_FILE = DATA_DIR / "user_plan.json"
-
-# -----------------------------
-# Authentication
-# -----------------------------
-USERS = {
-    "admin": "admin123",  # admin role
-    "user": "user123"     # normal user role
+# ---------------------------
+# User Authentication
+# ---------------------------
+users = {
+    "admin": {"password": "admin123", "role": "admin"},
+    "user": {"password": "user123", "role": "learner"},
 }
 
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+    st.session_state.role = None
+    st.session_state.username = None
 
 def login():
-    st.sidebar.subheader("🔑 Login")
-    username = st.sidebar.text_input("Username")
-    password = st.sidebar.text_input("Password", type="password")
-    if st.sidebar.button("Login"):
-        if username in USERS and USERS[username] == password:
-            st.session_state.user = username
-            st.session_state.role = "admin" if username == "admin" else "user"
-            st.sidebar.success(f"Welcome, {username}!")
+    st.title("🔐 Login")
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+    if st.button("Login"):
+        if username in users and users[username]["password"] == password:
+            st.session_state.logged_in = True
+            st.session_state.role = users[username]["role"]
+            st.session_state.username = username
+            st.success(f"Welcome {username}! Role: {st.session_state.role}")
         else:
-            st.sidebar.error("Invalid credentials")
+            st.error("Invalid username or password")
 
+def logout():
+    st.session_state.logged_in = False
+    st.session_state.role = None
+    st.session_state.username = None
 
-def require_login():
-    if "user" not in st.session_state:
-        st.warning("Please log in to access this feature.")
-        st.stop()
+# ---------------------------
+# Load or Create Datasets
+# ---------------------------
+DATA_PATH = "data"
+os.makedirs(DATA_PATH, exist_ok=True)
 
+def load_data(filename, default_df):
+    path = os.path.join(DATA_PATH, filename)
+    if os.path.exists(path):
+        return pd.read_csv(path)
+    else:
+        default_df.to_csv(path, index=False)
+        return default_df
 
-# -----------------------------
-# Data Handling
-# -----------------------------
-DEFAULT_COURSES = [
-    ["id", "title", "provider", "level", "tags", "description", "url", "est_hours"],
-    ["c1", "Python for Data Science", "Coursera", "Beginner", "python, pandas", "Intro to Python", "http://coursera.org", 20]
-]
-DEFAULT_BOOKS = [["id", "title", "provider", "level", "tags", "description", "url", "est_hours"]]
-DEFAULT_PROJECTS = [["id", "title", "provider", "level", "tags", "description", "url", "est_hours"]]
+courses_df = load_data(
+    "courses.csv",
+    pd.DataFrame([
+        {"title": "Python Basics", "description": "Learn Python fundamentals", "difficulty": "Beginner", "hours": 10},
+        {"title": "Data Science 101", "description": "Intro to Data Science", "difficulty": "Intermediate", "hours": 20},
+        {"title": "Deep Learning", "description": "Neural networks and deep learning", "difficulty": "Advanced", "hours": 30},
+    ])
+)
 
+books_df = load_data(
+    "books.csv",
+    pd.DataFrame([
+        {"title": "Hands-On ML", "author": "Geron", "description": "Machine learning with Scikit-learn & TensorFlow"},
+        {"title": "Deep Learning", "author": "Goodfellow", "description": "Foundations of deep learning"},
+    ])
+)
 
-def ensure_csv(file: Path, default_data: List[List]):
-    if not file.exists():
-        pd.DataFrame(default_data[1:], columns=default_data[0]).to_csv(file, index=False)
+projects_df = load_data(
+    "projects.csv",
+    pd.DataFrame([
+        {"title": "Stock Prediction", "description": "Predict stock prices using ML", "difficulty": "Intermediate", "hours": 25},
+        {"title": "Churn Prediction", "description": "Telecom churn model", "difficulty": "Intermediate", "hours": 15},
+    ])
+)
 
+# ---------------------------
+# Recommender System
+# ---------------------------
+def recommend(user_input, df, text_column="description", top_n=3):
+    corpus = df[text_column].fillna("").tolist() + [user_input]
+    vectorizer = TfidfVectorizer()
+    tfidf_matrix = vectorizer.fit_transform(corpus)
+    similarity = cosine_similarity(tfidf_matrix[-1], tfidf_matrix[:-1])
+    top_idx = similarity[0].argsort()[::-1][:top_n]
+    return df.iloc[top_idx]
 
-for f, d in [(COURSES_FILE, DEFAULT_COURSES), (BOOKS_FILE, DEFAULT_BOOKS), (PROJECTS_FILE, DEFAULT_PROJECTS)]:
-    ensure_csv(f, d)
+# ---------------------------
+# Guided Path Generator
+# ---------------------------
+def generate_path(df):
+    df_sorted = df.sort_values(by=["difficulty", "hours"], ascending=[True, True])
+    return df_sorted
 
-
-def load_datasets() -> Dict[str, pd.DataFrame]:
-    return {
-        "courses": pd.read_csv(COURSES_FILE),
-        "books": pd.read_csv(BOOKS_FILE),
-        "projects": pd.read_csv(PROJECTS_FILE)
-    }
-
-
-# -----------------------------
-# Recommender Engine
-# -----------------------------
-
-def _combine_text(row: pd.Series) -> str:
-    return " ".join([str(row.get("title", "")), str(row.get("tags", "")), str(row.get("description", ""))])
-
-
-def build_tfidf(df: pd.DataFrame):
-    corpus = df.apply(_combine_text, axis=1).values
-    vectorizer = TfidfVectorizer(stop_words="english")
-    X = vectorizer.fit_transform(corpus)
-    return vectorizer, X
-
-
-@st.cache_resource(show_spinner=False)
-def get_models(datasets: Dict[str, pd.DataFrame]):
-    return {name: build_tfidf(df) for name, df in datasets.items()}
-
-
-def recommend(df, vec, X, query, top_k=5):
-    q_vec = vec.transform([query])
-    sims = cosine_similarity(q_vec, X).ravel()
-    df = df.copy()
-    df["similarity"] = sims
-    return df.sort_values("similarity", ascending=False).head(top_k)
-
-
-# -----------------------------
-# Guided Learning Path
-# -----------------------------
-
-def guided_path(df: pd.DataFrame) -> pd.DataFrame:
-    # Sort by level then est_hours
-    level_order = {"Beginner": 1, "Intermediate": 2, "Advanced": 3}
-    df = df.copy()
-    df["level_num"] = df["level"].map(level_order).fillna(2)
-    return df.sort_values(["level_num", "est_hours"])
-
-
-# -----------------------------
-# Progress Persistence
-# -----------------------------
-
-def load_plan():
-    if PROGRESS_FILE.exists():
-        return json.loads(PROGRESS_FILE.read_text())
-    return {"items": []}
-
-
-def save_plan(plan):
-    PROGRESS_FILE.write_text(json.dumps(plan, indent=2))
-
-
-# -----------------------------
+# ---------------------------
 # Admin Page
-# -----------------------------
-
+# ---------------------------
 def admin_page():
-    st.subheader("⚙️ Admin Panel: Manage Datasets")
-    st.write("Upload CSVs to replace current datasets.")
-    for name, file in [("Courses", COURSES_FILE), ("Books", BOOKS_FILE), ("Projects", PROJECTS_FILE)]:
-        uploaded = st.file_uploader(f"Upload {name} CSV", type="csv", key=f"u_{name}")
-        if uploaded:
-            pd.read_csv(uploaded).to_csv(file, index=False)
-            st.success(f"{name} dataset updated!")
+    st.title("⚙️ Admin Panel")
+    st.write("Upload new CSVs to update datasets.")
 
+    uploaded_file = st.file_uploader("Upload CSV", type="csv")
+    dataset_choice = st.selectbox("Select dataset to replace", ["courses", "books", "projects"])
+    if uploaded_file and st.button("Upload"):
+        df_new = pd.read_csv(uploaded_file)
+        filename = f"{dataset_choice}.csv"
+        df_new.to_csv(os.path.join(DATA_PATH, filename), index=False)
+        st.success(f"{dataset_choice}.csv updated!")
 
-# -----------------------------
-# Main App
-# -----------------------------
+# ---------------------------
+# Learner Dashboard
+# ---------------------------
+def learner_page():
+    st.title("🎓 Personalized Learning Recommender")
 
-def main():
-    st.set_page_config(page_title="Learning Recommender", page_icon="🎓", layout="wide")
-    st.title(APP_TITLE)
+    skills = st.text_input("Enter your skills")
+    goals = st.text_input("Enter your learning goals")
+    if st.button("Get Recommendations"):
+        if skills or goals:
+            query = skills + " " + goals
+            st.subheader("📘 Recommended Courses")
+            st.write(recommend(query, courses_df))
+            st.subheader("📚 Recommended Books")
+            st.write(recommend(query, books_df))
+            st.subheader("💻 Recommended Projects")
+            st.write(recommend(query, projects_df))
+        else:
+            st.warning("Please enter some skills or goals.")
 
+    st.subheader("📊 Guided Learning Path")
+    st.write(generate_path(courses_df))
+
+# ---------------------------
+# App Flow
+# ---------------------------
+if not st.session_state.logged_in:
     login()
-    require_login()
-
-    datasets = load_datasets()
-    models = get_models(datasets)
+else:
+    st.sidebar.write(f"Logged in as {st.session_state.username} ({st.session_state.role})")
+    if st.sidebar.button("Logout"):
+        logout()
+        st.experimental_rerun()
 
     if st.session_state.role == "admin":
-        with st.sidebar:
-            if st.button("Go to Admin Page"):
-                st.session_state.page = "Admin"
-
-    page = st.session_state.get("page", "Recommend")
-    tabs = ["Recommend", "Track Progress", "Guided Path"]
-    if st.session_state.role == "admin":
-        tabs.append("Admin")
-
-    tab = st.radio("Navigate", tabs, index=tabs.index(page))
-    st.session_state.page = tab
-
-    if tab == "Recommend":
-        skills = st.text_input("Enter skills (comma-separated)")
-        goals = st.text_input("Enter goals")
-        query = skills + " " + goals
-        for name, df in datasets.items():
-            vec, X = models[name]
-            st.subheader(f"Recommended {name.title()}")
-            recs = recommend(df, vec, X, query)
-            st.dataframe(recs[["title", "provider", "level", "similarity"]])
-
-    elif tab == "Track Progress":
-        plan = load_plan()
-        st.subheader("Your Learning Plan")
-        df = pd.DataFrame(plan["items"])
-        st.data_editor(df, num_rows="dynamic")
-        if st.button("Save Plan"):
-            plan["items"] = df.to_dict(orient="records")
-            save_plan(plan)
-
-    elif tab == "Guided Path":
-        st.subheader("🧭 Suggested Guided Path")
-        combined = pd.concat(datasets.values())
-        path = guided_path(combined)
-        st.dataframe(path[["title", "level", "est_hours"]])
-
-    elif tab == "Admin":
         admin_page()
-
-
-if __name__ == "__main__":
-    main()
+    else:
+        learner_page()
